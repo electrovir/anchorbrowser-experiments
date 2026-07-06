@@ -1,24 +1,13 @@
 import {assert} from '@augment-vir/assert';
-import {log, wait} from '@augment-vir/common';
-import {RestVirClient} from '@rest-vir/api';
+import {log, wait, type ArrayElement} from '@augment-vir/common';
+import {Anchorbrowser} from 'anchorbrowser';
 import {writeFile} from 'node:fs/promises';
-import {parseJsonWithShape} from 'object-shape-tester';
-import {
-    anchorApi,
-    createSessionEndpoint,
-    downloadFileLinkResponseShape,
-    endSessionEndpoint,
-    listSessionDownloadsEndpoint,
-    type AnchorDownload,
-    type AnchorSessionConfig,
-} from './anchor.api.js';
+import {defineShape, parseJsonWithShape} from 'object-shape-tester';
 import {viewportSize, type PageTask} from './browser-runner.js';
 import {downloadOutputPath} from './file-paths.js';
 import {type SecretsClient} from './secrets.js';
 
 const freeTier = false as boolean;
-
-const anchorApiOrigin = 'https://api.anchorbrowser.io';
 
 /**
  * Stable Anchor Browser profile name. Anchor identifies persistent profiles by name (rather than a
@@ -27,7 +16,38 @@ const anchorApiOrigin = 'https://api.anchorbrowser.io';
  */
 const anchorProfileName = 'anchorbrowser-experiments';
 
-type AnchorClient = RestVirClient<typeof anchorApi>;
+/**
+ * Anchor's session-creation params. The SDK's generated `SessionCreateParams` type (v0.16.x) does
+ * not model `browser.pdf_viewer`, which the REST API still accepts, so it is merged in here to keep
+ * PDFs downloading (rather than rendering inline) so the session-downloads API captures them.
+ */
+type AnchorSessionConfig = Anchorbrowser.SessionCreateParams & {
+    browser?:
+        | {
+              pdf_viewer?:
+                  | {
+                        active?: boolean | undefined;
+                    }
+                  | undefined;
+          }
+        | undefined;
+};
+
+/** A single file Anchor captured during a session, as returned by `sessions.retrieveDownloads`. */
+type AnchorDownload = ArrayElement<
+    NonNullable<NonNullable<Anchorbrowser.SessionRetrieveDownloadsResponse['data']>['items']>
+>;
+
+/**
+ * The `data` payload returned by a download's `file_link`. It does not contain the file itself, but
+ * a short-lived pre-signed S3 URL (`SignedUrl`) from which the bytes are fetched.
+ */
+const downloadFileLinkResponseShape = defineShape({
+    data: {
+        SignedUrl: '',
+        status: '',
+    },
+});
 
 /**
  * Polls Anchor's session-downloads API until the session has at least one captured file (the sync
@@ -35,32 +55,18 @@ type AnchorClient = RestVirClient<typeof anchorApi>;
  */
 async function listAnchorDownloads({
     client,
-    apiKey,
     sessionId,
     attemptsLeft = 30,
 }: Readonly<{
-    client: AnchorClient;
-    apiKey: string;
+    client: Anchorbrowser;
     sessionId: string;
     attemptsLeft?: number;
 }>): Promise<AnchorDownload[]> {
-    const result = await client.fetch(listSessionDownloadsEndpoint).GET({
-        pathParams: {
-            sessionId,
-        },
-        requiredHeaders: {
-            'anchor-api-key': apiKey,
-        },
-    });
-    if (result.unexpectedError) {
-        throw new Error(
-            `Anchor Browser downloads list failed: ${result.unexpectedError.status} ${result.unexpectedError.responseData || ''}.`,
-        );
-    }
-    assert.isDefined(result.Ok, 'Anchor Browser downloads list returned no data.');
+    const response = await client.sessions.retrieveDownloads(sessionId);
+    const items = response.data?.items ?? [];
 
-    if (result.Ok.responseData.data.count > 0 || attemptsLeft <= 1) {
-        return result.Ok.responseData.data.items;
+    if ((response.data?.count ?? 0) > 0 || attemptsLeft <= 1) {
+        return items;
     }
 
     await wait({
@@ -68,18 +74,16 @@ async function listAnchorDownloads({
     });
     return await listAnchorDownloads({
         client,
-        apiKey,
         sessionId,
         attemptsLeft: attemptsLeft - 1,
     });
 }
 
 /**
- * Retrieves a single Anchor download's bytes. Both requests stay raw `fetch` calls (rather than
- * `rest-vir` endpoints) because these are absolute URLs Anchor hands back per file, not fixed API
- * paths. The api-key-protected `file_link` does not return the file itself; it returns a JSON
- * envelope containing a short-lived pre-signed S3 URL, which is then fetched (unauthenticated) for
- * the actual bytes.
+ * Retrieves a single Anchor download's bytes. These stay raw `fetch` calls (rather than SDK
+ * methods) because the SDK does not model retrieving a download's bytes: the api-key-protected
+ * `file_link` does not return the file itself; it returns a JSON envelope containing a short-lived
+ * pre-signed S3 URL, which is then fetched (unauthenticated) for the actual bytes.
  */
 async function fetchAnchorDownload({
     apiKey,
@@ -111,30 +115,19 @@ async function fetchAnchorDownload({
 /** Terminates the remote Anchor session so it does not stay alive until its idle timeout. */
 async function endAnchorSession({
     client,
-    apiKey,
     sessionId,
-}: Readonly<{client: AnchorClient; apiKey: string; sessionId: string}>): Promise<void> {
+}: Readonly<{client: Anchorbrowser; sessionId: string}>): Promise<void> {
     log.faint(`Terminating Anchor Browser session ${sessionId}...`);
-    const result = await client.fetch(endSessionEndpoint).DELETE({
-        pathParams: {
-            sessionId,
-        },
-        requiredHeaders: {
-            'anchor-api-key': apiKey,
-        },
-    });
-    if (result.unexpectedError) {
-        throw new Error(
-            `Anchor Browser session termination failed: ${result.unexpectedError.status} ${result.unexpectedError.responseData || ''}.`,
-        );
-    }
+    await client.sessions.delete(sessionId);
 }
 
 export async function withAnchorBrowserPage<T>(
     secretsClient: Readonly<SecretsClient>,
     task: PageTask<T>,
 ): Promise<T> {
-    const client: AnchorClient = new RestVirClient(anchorApi, anchorApiOrigin);
+    const client = new Anchorbrowser({
+        apiKey: secretsClient.get.apiKey,
+    });
 
     log.faint('Creating Anchor Browser session...');
     const sessionConfig: AnchorSessionConfig = freeTier
@@ -173,22 +166,16 @@ export async function withAnchorBrowserPage<T>(
               },
           };
 
-    const sessionResult = await client.fetch(createSessionEndpoint).POST({
-        requestData: sessionConfig,
-        requiredHeaders: {
-            'anchor-api-key': secretsClient.get.apiKey,
-        },
-    });
-    if (sessionResult.unexpectedError) {
-        throw new Error(
-            `Anchor Browser session creation failed: ${sessionResult.unexpectedError.status} ${sessionResult.unexpectedError.responseData || ''}.`,
-        );
-    }
-    const sessionSuccess = sessionResult.Ok ?? sessionResult.Created;
-    assert.isDefined(sessionSuccess, 'Anchor Browser session creation returned no data.');
+    const sessionResponse = await client.sessions.create(sessionConfig);
+    const session = sessionResponse.data;
+    assert.isDefined(session, 'Anchor Browser session creation returned no data.');
+    assert.isDefined(session.id, 'Anchor Browser session creation returned no id.');
+    assert.isDefined(session.cdp_url, 'Anchor Browser session creation returned no CDP url.');
 
-    const session = sessionSuccess.responseData.data;
-    log.faint(`Anchor Browser session created: ${session.id}`);
+    /** Captured so the narrowed (non-`undefined`) id stays typed inside the closures below. */
+    const sessionId = session.id;
+
+    log.faint(`Anchor Browser session created: ${sessionId}`);
     if (!freeTier) {
         log.faint(`Using Anchor Browser profile: ${anchorProfileName}`);
     }
@@ -231,8 +218,7 @@ export async function withAnchorBrowserPage<T>(
                 log.faint('Download complete; waiting for Anchor Browser to sync it to storage...');
                 const downloads = await listAnchorDownloads({
                     client,
-                    apiKey: secretsClient.get.apiKey,
-                    sessionId: session.id,
+                    sessionId,
                 });
                 if (!downloads.length) {
                     throw new Error(
@@ -242,13 +228,23 @@ export async function withAnchorBrowserPage<T>(
 
                 const savedPaths = await Promise.all(
                     downloads.map(async (entry) => {
+                        assert.isDefined(
+                            entry.file_link,
+                            'Anchor Browser download entry has no file link.',
+                        );
+                        const fileName = entry.suggested_file_name || entry.original_file_name;
+                        assert.isDefined(
+                            fileName,
+                            'Anchor Browser download entry has no file name.',
+                        );
+
                         const fileBytes = await fetchAnchorDownload({
                             apiKey: secretsClient.get.apiKey,
                             fileLink: entry.file_link,
                         });
                         const outputPath = downloadOutputPath({
                             label: 'anchor',
-                            fileName: entry.suggested_file_name || entry.original_file_name,
+                            fileName,
                         });
                         log.faint(`Saving Anchor Browser download to ${outputPath}...`);
                         await writeFile(outputPath, fileBytes);
@@ -262,8 +258,7 @@ export async function withAnchorBrowserPage<T>(
         await browser.close().catch((error: unknown) => log.error(error));
         await endAnchorSession({
             client,
-            apiKey: secretsClient.get.apiKey,
-            sessionId: session.id,
+            sessionId,
         }).catch((error: unknown) => log.error(error));
     }
 }

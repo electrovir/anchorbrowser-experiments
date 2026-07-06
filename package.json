@@ -42,7 +42,7 @@
         "@augment-vir/common": "^32.0.0",
         "@augment-vir/node": "^32.0.0",
         "@electrovir/rebrowser-playwright": "^1.61.101",
-        "@rest-vir/api": "^2.2.0",
+        "anchorbrowser": "^0.16.3",
         "cli-vir": "^1.0.3",
         "object-shape-tester": "^6.14.0",
         "updating-secrets": "^1.3.0",
