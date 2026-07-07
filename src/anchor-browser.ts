@@ -1,8 +1,8 @@
 import {assert} from '@augment-vir/assert';
-import {log, wait, type ArrayElement} from '@augment-vir/common';
-import {Anchorbrowser} from 'anchorbrowser';
+import {HttpMethod, log, wait} from '@augment-vir/common';
+import {defineApi, defineEndpoint, HttpStatus, RestVirClient} from '@rest-vir/api';
 import {writeFile} from 'node:fs/promises';
-import {defineShape, parseJsonWithShape} from 'object-shape-tester';
+import {assertWrapValidShape, defineShape, nullableShape, unknownShape} from 'object-shape-tester';
 import {viewportSize, type PageTask} from './browser-runner.js';
 import {downloadOutputPath} from './file-paths.js';
 import {type SecretsClient} from './secrets.js';
@@ -17,26 +17,56 @@ const freeTier = false as boolean;
 const anchorProfileName = 'anchorbrowser-experiments';
 
 /**
- * Anchor's session-creation params. The SDK's generated `SessionCreateParams` type (v0.16.x) does
- * not model `browser.pdf_viewer`, which the REST API still accepts, so it is merged in here to keep
- * PDFs downloading (rather than rendering inline) so the session-downloads API captures them.
+ * Shape of the `POST /v1/sessions` request body. Only the fields these experiments set are modeled.
+ * `session` and `browser` are nullable so the free-tier path (which sends `{}`) also validates.
+ * `browser.pdf_viewer.active: false` forces PDFs to download (rather than render inline) so the
+ * session-downloads API captures them.
  */
-type AnchorSessionConfig = Anchorbrowser.SessionCreateParams & {
-    browser?:
-        | {
-              pdf_viewer?:
-                  | {
-                        active?: boolean | undefined;
-                    }
-                  | undefined;
-          }
-        | undefined;
-};
+const anchorSessionCreateRequestShape = defineShape({
+    session: nullableShape({
+        proxy: nullableShape({
+            active: true,
+            type: '',
+            country_code: '',
+            region: nullableShape(''),
+        }),
+    }),
+    browser: nullableShape({
+        profile: {
+            name: '',
+            persist: true,
+        },
+        adblock: {
+            active: true,
+        },
+        popup_blocker: {
+            active: true,
+        },
+        extra_stealth: {
+            active: true,
+        },
+        pdf_viewer: {
+            active: true,
+        },
+        viewport: {
+            width: 0,
+            height: 0,
+        },
+    }),
+});
+type AnchorSessionConfig = typeof anchorSessionCreateRequestShape.runtimeType;
 
-/** A single file Anchor captured during a session, as returned by `sessions.retrieveDownloads`. */
-type AnchorDownload = ArrayElement<
-    NonNullable<NonNullable<Anchorbrowser.SessionRetrieveDownloadsResponse['data']>['items']>
->;
+/**
+ * A single file Anchor captured during a session, as listed by its session-downloads API. Every
+ * field is optional because Anchor omits them depending on the file.
+ */
+const anchorDownloadShape = defineShape({
+    id: nullableShape(''),
+    file_link: nullableShape(''),
+    suggested_file_name: nullableShape(''),
+    original_file_name: nullableShape(''),
+});
+type AnchorDownload = typeof anchorDownloadShape.runtimeType;
 
 /**
  * The `data` payload returned by a download's `file_link`. It does not contain the file itself, but
@@ -49,23 +79,117 @@ const downloadFileLinkResponseShape = defineShape({
     },
 });
 
+const anchorSessionCreateEndpoint = defineEndpoint({
+    path: '/v1/sessions',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: anchorSessionCreateRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: defineShape({
+                        data: {
+                            id: '',
+                            cdp_url: '',
+                        },
+                    }),
+                },
+            },
+            clientOriginRequirement: {
+                anyOrigin: true,
+            },
+        },
+    },
+});
+
+const anchorSessionDownloadsEndpoint = defineEndpoint({
+    path: '/v1/sessions/:sessionId/downloads',
+    requests: {
+        [HttpMethod.Get]: {
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: defineShape({
+                        data: nullableShape({
+                            items: [
+                                anchorDownloadShape,
+                            ],
+                        }),
+                    }),
+                },
+            },
+            clientOriginRequirement: {
+                anyOrigin: true,
+            },
+        },
+    },
+});
+
+const anchorSessionDeleteEndpoint = defineEndpoint({
+    path: '/v1/sessions/:sessionId',
+    requests: {
+        [HttpMethod.Delete]: {
+            responses: {
+                /** The delete response body is intentionally ignored (`unknownShape`). */
+                [HttpStatus.Ok]: {
+                    responseData: unknownShape(),
+                },
+            },
+            clientOriginRequirement: {
+                anyOrigin: true,
+            },
+        },
+    },
+});
+
+const anchorApiDefinition = defineApi({
+    apiName: 'anchor-browser',
+    endpoints: [
+        anchorSessionCreateEndpoint,
+        anchorSessionDownloadsEndpoint,
+        anchorSessionDeleteEndpoint,
+    ],
+});
+
+/**
+ * Typed rest-vir client for Anchor's session API. These experiments only need session create /
+ * delete / list-downloads, so a small API definition replaces the full Anchor SDK (which pulls in a
+ * duplicate Playwright).
+ */
+const anchorApi = new RestVirClient(anchorApiDefinition, 'https://api.anchorbrowser.io');
+
+/** The api-key header Anchor authenticates every session request with. */
+function anchorAuthHeaders(apiKey: string) {
+    return {
+        'anchor-api-key': apiKey,
+    };
+}
+
 /**
  * Polls Anchor's session-downloads API until the session has at least one captured file (the sync
  * happens asynchronously after the browser finishes downloading), then returns the file list.
  */
 async function listAnchorDownloads({
-    client,
+    apiKey,
     sessionId,
     attemptsLeft = 30,
 }: Readonly<{
-    client: Anchorbrowser;
+    apiKey: string;
     sessionId: string;
     attemptsLeft?: number;
 }>): Promise<AnchorDownload[]> {
-    const response = await client.sessions.retrieveDownloads(sessionId);
-    const items = response.data?.items ?? [];
+    const result = await anchorApi.fetch(anchorSessionDownloadsEndpoint).GET({
+        pathParams: {
+            sessionId,
+        },
+        options: {
+            headers: anchorAuthHeaders(apiKey),
+        },
+    });
+    if (!result.Ok) {
+        throw new Error(describeAnchorFailure('GET /v1/sessions/:sessionId/downloads', result));
+    }
+    const items = result.Ok.responseData.data?.items ?? [];
 
-    if ((response.data?.count ?? 0) > 0 || attemptsLeft <= 1) {
+    if (items.length > 0 || attemptsLeft <= 1) {
         return items;
     }
 
@@ -73,35 +197,38 @@ async function listAnchorDownloads({
         seconds: 1,
     });
     return await listAnchorDownloads({
-        client,
+        apiKey,
         sessionId,
         attemptsLeft: attemptsLeft - 1,
     });
 }
 
 /**
- * Retrieves a single Anchor download's bytes. These stay raw `fetch` calls (rather than SDK
- * methods) because the SDK does not model retrieving a download's bytes: the api-key-protected
- * `file_link` does not return the file itself; it returns a JSON envelope containing a short-lived
- * pre-signed S3 URL, which is then fetched (unauthenticated) for the actual bytes.
+ * Retrieves a single Anchor download's bytes. Stays a raw `fetch` (rather than a rest-vir endpoint)
+ * because `file_link` is an opaque, per-file URL and the bytes live on a different origin: the
+ * api-key-protected `file_link` returns a JSON envelope containing a short-lived pre-signed S3 URL,
+ * which is then fetched (unauthenticated) for the actual bytes.
  */
 async function fetchAnchorDownload({
     apiKey,
     fileLink,
 }: Readonly<{apiKey: string; fileLink: string}>): Promise<Buffer> {
     const linkResponse = await fetch(fileLink, {
-        headers: {
-            'anchor-api-key': apiKey,
-        },
+        headers: anchorAuthHeaders(apiKey),
     });
     if (!linkResponse.ok) {
         throw new Error(
             `Anchor Browser download link fetch failed: ${linkResponse.status} ${linkResponse.statusText}.`,
         );
     }
-    const linkBody = parseJsonWithShape(await linkResponse.text(), downloadFileLinkResponseShape, {
-        allowExtraKeys: true,
-    });
+    const linkBody = assertWrapValidShape(
+        await linkResponse.json(),
+        downloadFileLinkResponseShape,
+        {
+            allowExtraKeys: true,
+        },
+        'Anchor Browser download link response did not match the expected shape.',
+    );
 
     const fileResponse = await fetch(linkBody.data.SignedUrl);
     if (!fileResponse.ok) {
@@ -114,21 +241,24 @@ async function fetchAnchorDownload({
 
 /** Terminates the remote Anchor session so it does not stay alive until its idle timeout. */
 async function endAnchorSession({
-    client,
+    apiKey,
     sessionId,
-}: Readonly<{client: Anchorbrowser; sessionId: string}>): Promise<void> {
+}: Readonly<{apiKey: string; sessionId: string}>): Promise<void> {
     log.faint(`Terminating Anchor Browser session ${sessionId}...`);
-    await client.sessions.delete(sessionId);
+    await anchorApi.fetch(anchorSessionDeleteEndpoint).DELETE({
+        pathParams: {
+            sessionId,
+        },
+        options: {
+            headers: anchorAuthHeaders(apiKey),
+        },
+    });
 }
 
 export async function withAnchorBrowserPage<T>(
     secretsClient: Readonly<SecretsClient>,
     task: PageTask<T>,
 ): Promise<T> {
-    const client = new Anchorbrowser({
-        apiKey: secretsClient.get.apiKey,
-    });
-
     log.faint('Creating Anchor Browser session...');
     const sessionConfig: AnchorSessionConfig = freeTier
         ? {}
@@ -166,14 +296,16 @@ export async function withAnchorBrowserPage<T>(
               },
           };
 
-    const sessionResponse = await client.sessions.create(sessionConfig);
-    const session = sessionResponse.data;
-    assert.isDefined(session, 'Anchor Browser session creation returned no data.');
-    assert.isDefined(session.id, 'Anchor Browser session creation returned no id.');
-    assert.isDefined(session.cdp_url, 'Anchor Browser session creation returned no CDP url.');
-
-    /** Captured so the narrowed (non-`undefined`) id stays typed inside the closures below. */
-    const sessionId = session.id;
+    const createResult = await anchorApi.fetch(anchorSessionCreateEndpoint).POST({
+        requestData: sessionConfig,
+        options: {
+            headers: anchorAuthHeaders(secretsClient.get.apiKey),
+        },
+    });
+    if (!createResult.Ok) {
+        throw new Error(describeAnchorFailure('POST /v1/sessions', createResult));
+    }
+    const sessionId = createResult.Ok.responseData.data.id;
 
     log.faint(`Anchor Browser session created: ${sessionId}`);
     if (!freeTier) {
@@ -183,7 +315,7 @@ export async function withAnchorBrowserPage<T>(
     log.faint('Connecting via CDP...');
     const browser = await (
         await import('@electrovir/rebrowser-playwright')
-    ).chromium.connectOverCDP(session.cdp_url);
+    ).chromium.connectOverCDP(createResult.Ok.responseData.data.cdp_url);
 
     try {
         const context = browser.contexts()[0];
@@ -217,7 +349,7 @@ export async function withAnchorBrowserPage<T>(
 
                 log.faint('Download complete; waiting for Anchor Browser to sync it to storage...');
                 const downloads = await listAnchorDownloads({
-                    client,
+                    apiKey: secretsClient.get.apiKey,
                     sessionId,
                 });
                 if (!downloads.length) {
@@ -257,8 +389,26 @@ export async function withAnchorBrowserPage<T>(
     } finally {
         await browser.close().catch((error: unknown) => log.error(error));
         await endAnchorSession({
-            client,
+            apiKey: secretsClient.get.apiKey,
             sessionId,
         }).catch((error: unknown) => log.error(error));
     }
+}
+
+function describeAnchorFailure(
+    endpoint: string,
+    result: Readonly<{unexpectedError?: {response: Response; responseData: unknown} | undefined}>,
+) {
+    const response = result.unexpectedError?.response;
+    const data = result.unexpectedError?.responseData;
+    return [
+        'Anchor Browser API call failed for',
+        endpoint,
+        '-',
+        response ? String(response.status) : '',
+        response?.statusText || '',
+        data ? JSON.stringify(data) : '',
+    ]
+        .filter(Boolean)
+        .join(' ');
 }
