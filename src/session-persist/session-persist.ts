@@ -2,6 +2,7 @@ import {assert} from '@augment-vir/assert';
 import {log} from '@augment-vir/common';
 import {type Page} from '@electrovir/rebrowser-playwright';
 import {buildUrl} from 'url-vir';
+import {screenshotPngPath} from '../file-paths.js';
 
 /**
  * The published first-party persistence test page. It exercises every browser storage mechanism as
@@ -79,5 +80,20 @@ export async function runPersistencePage({
 
     const json = await resultHandle.jsonValue();
     assert.isString(json, `[${label}] the persistence page produced no result.`);
-    return JSON.parse(json) as PersistenceRunResult;
+    const result = JSON.parse(json) as PersistenceRunResult;
+
+    const screenshotPath = screenshotPngPath(`session-persist-${label}-${mode}`);
+    log.faint(`[${label}] Writing ${mode} screenshot to ${screenshotPath}...`);
+    await page.screenshot({
+        path: screenshotPath,
+        fullPage: true,
+    });
+
+    result.reports.forEach((report) => {
+        if (report.error) {
+            log.warning(`[${label}] ${mode} run — ${report.label} error: ${report.error}`);
+        }
+    });
+
+    return result;
 }
