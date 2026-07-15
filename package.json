@@ -17,12 +17,11 @@
     "sideEffects": false,
     "type": "module",
     "scripts": {
-        "bot-detect": "tsx src/bot-detect/bot-detect.script.ts",
         "compile": "virmator compile",
         "download": "tsx src/download/download.script.ts",
+        "fingerprint": "tsx src/fingerprint/fingerprint.script.ts",
         "format": "virmator format",
         "lint": "virmator lint fix",
-        "session-persist": "tsx src/session-persist/session-persist.script.ts",
         "start": "tsx src/hit-site/hit-site.script.ts",
         "test": "virmator test node",
         "test:all": "npm run compile && runstorm --names tests,spelling,format,deps,lint \"npm run test\" \"npm run test:spelling\" \"npm run test:format\" \"npm run test:deps\" \"npm run test:lint\"",
